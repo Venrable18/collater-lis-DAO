@@ -101,6 +101,7 @@ contract LocalDAOFactory is Ownable {
         }
 
         address[] memory activeDAOs = new address[](activeCount);
+        
         uint256 index = 0;
         for (uint256 i = 0; i < allDAOs.length; i++) {
             if (daoInfo[allDAOs[i]].isActive) {

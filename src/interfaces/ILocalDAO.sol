@@ -5,13 +5,9 @@ pragma solidity ^0.8.20;
  * @title ILocalDAO
  * @notice Interface for LocalDAO contract
  * @dev Used by Factory for standardized DAO interactions
+ * @dev Enums are defined in LocalDAO contract to avoid duplication
  */
 interface ILocalDAO {
-    // Enums
-    enum Status { PENDING, ACTIVE, ENDED, INCOMPLETE }
-    enum Category { HEALTH, EDUCATION, ENTERTAINMENT, AGRICULTURE, TECHNOLOGY, RETAIL, OTHER }
-    enum Grade { A, B, C, D }
-
     // View functions
     function name() external view returns (string memory);
     function location() external view returns (string memory);

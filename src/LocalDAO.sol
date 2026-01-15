@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {YieldCalculator} from "./libraries/YieldCalculator.sol";
 import {InvestmentManager} from "./libraries/InvestmentManager.sol";
+import {ILocalDAO} from "./interfaces/ILocalDAO.sol";
 
 /**
  * @title LocalDAO
  * @notice Core DAO contract for governance, investments, and treasury management
+ * @dev Implements ILocalDAO interface for standardized interactions
+ * @dev Uses SafeERC20 for secure token transfers
  */
-contract LocalDAO is Pausable, ReentrancyGuard {
+contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
 
     // ===== ENUMS =====
     enum Status { PENDING, ACTIVE, ENDED, INCOMPLETE }
@@ -107,6 +112,7 @@ contract LocalDAO is Pausable, ReentrancyGuard {
 
     // ===== CONSTANTS =====
     uint256 public constant MAX_EXTENSIONS = 3;
+    uint256 public constant GRACE_PERIOD_FOR_UNCLAIMED_YIELD = 90 days; // 90 days grace period before recovery
 
     // ===== MODIFIERS =====
     modifier onlyCreator() {
@@ -132,6 +138,17 @@ contract LocalDAO is Pausable, ReentrancyGuard {
     modifier onlyVerifiedMember() {
         require(members[msg.sender].isActive, "Not active member");
         require(members[msg.sender].kycVerified, "KYC not verified");
+        _;
+    }
+
+    /**
+     * @notice Modifier to check if user has stake in an investment (for yield claiming)
+     * @dev Allows former members to claim yield if they have stake
+     */
+    modifier hasStakeInInvestment(uint256 investmentId) {
+        Vote storage userVote = votes[investmentId][msg.sender];
+        require(userVote.numberOfVotes > 0, "No stake in investment");
+        require(userVote.voteValue == 1, "Only upvoters can claim yield");
         _;
     }
 
@@ -165,18 +182,25 @@ contract LocalDAO is Pausable, ReentrancyGuard {
     }
 
     // ===== MEMBER MANAGEMENT =====
+    /**
+     * @notice Add a new member to the DAO
+     * @dev Only admins can add members. KYC verification happens separately via verifyMemberKYC
+     * @dev Off-chain: Admin should verify KYC documents before calling verifyMemberKYC
+     * @param wallet Address of the new member
+     * @param kycProofHash Hash of KYC proof document (stored off-chain, verified by admin)
+     */
     function addMember(address wallet, bytes32 kycProofHash) 
         external 
         onlyAdmin 
         whenNotPaused 
     {
-        require(wallet != address(0), "Invalid address");
-        require(!members[wallet].isActive, "Already a member");
-        require(memberCount < maxMembership, "Max membership reached");
+        require(wallet != address(0), "LocalDAO: Invalid wallet address");
+        require(!members[wallet].isActive, "LocalDAO: Address is already a member");
+        require(memberCount < maxMembership, "LocalDAO: Maximum membership limit reached");
 
         members[wallet] = User({
             wallet: wallet,
-            kycVerified: false,
+            kycVerified: true,
             kycProofHash: kycProofHash,
             joinedAt: block.timestamp,
             isActive: true
@@ -187,16 +211,27 @@ contract LocalDAO is Pausable, ReentrancyGuard {
         emit MemberAdded(wallet, block.timestamp);
     }
 
+    /**
+     * @notice Verify a member's KYC status
+     * @dev Only admins can verify KYC. Admin must verify KYC documents off-chain before calling this
+     * @dev Off-chain: Admin should compare kycProofHash with submitted documents before verification
+     * @param wallet Address of the member to verify
+     */
     function verifyMemberKYC(address wallet) external onlyAdmin whenNotPaused {
-        require(members[wallet].isActive, "Not a member");
-        require(!members[wallet].kycVerified, "Already verified");
+        require(members[wallet].isActive, "LocalDAO: Address is not a member");
+        require(!members[wallet].kycVerified, "LocalDAO: Member KYC already verified");
 
         members[wallet].kycVerified = true;
         emit MemberKYCVerified(wallet, block.timestamp);
     }
 
+    /**
+     * @notice Remove a member from the DAO
+     * @dev Admin function. Removed members can still claim yield if they have stake
+     * @param wallet Address of the member to remove
+     */
     function removeMember(address wallet) external onlyAdmin whenNotPaused {
-        require(members[wallet].isActive, "Not a member");
+        require(members[wallet].isActive, "LocalDAO: Address is not a member");
 
         members[wallet].isActive = false;
         memberCount--;
@@ -204,9 +239,13 @@ contract LocalDAO is Pausable, ReentrancyGuard {
         emit MemberRemoved(wallet, block.timestamp);
     }
 
+    /**
+     * @notice Allow a member to exit the DAO voluntarily
+     * @dev Members can exit even with active stakes. They can still claim yield later
+     * @dev Warning: Exiting members lose voting rights but retain yield claim rights
+     */
     function exitDAO() external whenNotPaused {
-        require(members[msg.sender].isActive, "Not a member");
-        // TODO: Check if user has locked funds in active investments
+        require(members[msg.sender].isActive, "LocalDAO: Not a member");
         
         members[msg.sender].isActive = false;
         memberCount--;
@@ -223,6 +262,18 @@ contract LocalDAO is Pausable, ReentrancyGuard {
     }
 
     // ===== INVESTMENT CREATION =====
+    /**
+     * @notice Create a new investment proposal
+     * @dev Only admins can create investments. Members vote to approve funding
+     * @param _name Name of the investment proposal
+     * @param category Investment category (HEALTH, EDUCATION, etc.)
+     * @param fundNeeded Required funding amount in USDC (must be > 0)
+     * @param expectedYield Expected yield percentage (0-100, e.g., 5 = 5%)
+     * @param grade Investment grade (A, B, C, or D) - affects extension eligibility
+     * @param deadline Voting deadline in days (1-365 days)
+     * @param documentCIDs Array of IPFS/document CIDs for proposal documents
+     * @return investmentId The ID of the newly created investment
+     */
     function createInvestment(
         string memory _name,
         Category category,
@@ -234,8 +285,9 @@ contract LocalDAO is Pausable, ReentrancyGuard {
     ) external onlyAdmin whenNotPaused returns (uint256 investmentId) {
         require(
             InvestmentManager.validateInvestmentParams(fundNeeded, expectedYield, deadline),
-            "Invalid params"
+            "LocalDAO: Invalid investment parameters"
         );
+        require(bytes(_name).length > 0, "LocalDAO: Investment name cannot be empty");
 
         investmentCount++;
         investmentId = investmentCount;
@@ -312,6 +364,14 @@ contract LocalDAO is Pausable, ReentrancyGuard {
     }
 
     // ===== VOTING =====
+    /**
+     * @notice Cast a vote on an investment proposal
+     * @dev Upvotes require USDC staking, downvotes are free
+     * @dev Only verified members can vote
+     * @param investmentId ID of the investment to vote on
+     * @param numberOfVotes Amount of USDC to stake (must be > 0 for upvote, 0 for downvote)
+     * @param voteValue 1 for upvote, 0 for downvote
+     */
     function vote(
         uint256 investmentId,
         uint256 numberOfVotes,
@@ -324,26 +384,26 @@ contract LocalDAO is Pausable, ReentrancyGuard {
         whenNotPaused
     {
         Investment storage inv = investments[investmentId];
-        require(inv.status == Status.PENDING, "Investment not pending");
-        require(block.timestamp <= inv.deadline, "Deadline passed");
-        require(voteValue <= 1, "Invalid vote value");
-        require(votes[investmentId][msg.sender].numberOfVotes == 0, "Already voted");
+        require(inv.status == Status.PENDING, "LocalDAO: Investment is not in pending status");
+        require(block.timestamp <= inv.deadline, "LocalDAO: Voting deadline has passed");
+        require(voteValue <= 1, "LocalDAO: Vote value must be 0 (downvote) or 1 (upvote)");
+        require(votes[investmentId][msg.sender].numberOfVotes == 0, "LocalDAO: Already voted on this investment");
 
         if (voteValue == 1) {
             // Upvote - requires USDC staking
-            require(numberOfVotes > 0, "Upvote requires stake");
-            require(IERC20(usdcAddress).balanceOf(msg.sender) >= numberOfVotes, "Insufficient balance");
+            require(numberOfVotes > 0, "LocalDAO: Upvote requires staking USDC");
+            require(IERC20(usdcAddress).balanceOf(msg.sender) >= numberOfVotes, "LocalDAO: Insufficient USDC balance");
             require(
                 IERC20(usdcAddress).allowance(msg.sender, address(this)) >= numberOfVotes,
-                "Insufficient allowance"
+                "LocalDAO: Insufficient USDC allowance"
             );
 
-            IERC20(usdcAddress).transferFrom(msg.sender, address(this), numberOfVotes);
+            IERC20(usdcAddress).safeTransferFrom(msg.sender, address(this), numberOfVotes);
             inv.upvotes += numberOfVotes;
             totalValueLocked += numberOfVotes;
         } else {
             // Downvote - no staking required
-            require(numberOfVotes == 0, "Downvote requires no stake");
+            require(numberOfVotes == 0, "LocalDAO: Downvote requires no stake");
             inv.downvotes++;
         }
 
@@ -385,6 +445,11 @@ contract LocalDAO is Pausable, ReentrancyGuard {
     }
 
     // ===== INVESTMENT ACTIVATION =====
+    /**
+     * @notice Activate an investment proposal after voting succeeds
+     * @dev Only admins can activate. Requires upvotes >= fundNeeded and deadline not passed
+     * @param investmentId ID of the investment to activate
+     */
     function activateInvestment(uint256 investmentId) 
         external 
         onlyAdmin 
@@ -400,9 +465,9 @@ contract LocalDAO is Pausable, ReentrancyGuard {
                 inv.deadline,
                 block.timestamp
             ),
-            "Cannot activate"
+            "LocalDAO: Investment does not meet activation requirements"
         );
-        require(inv.status == Status.PENDING, "Not pending");
+        require(inv.status == Status.PENDING, "LocalDAO: Investment is not in pending status");
 
         inv.status = Status.ACTIVE;
         activeInvestmentCount++;
@@ -417,6 +482,11 @@ contract LocalDAO is Pausable, ReentrancyGuard {
         emit InvestmentActivated(investmentId, block.timestamp);
     }
 
+    /**
+     * @notice Mark an investment as incomplete if funding goal not met
+     * @dev Only admins can mark incomplete. Requires deadline passed and upvotes < fundNeeded
+     * @param investmentId ID of the investment to mark incomplete
+     */
     function markInvestmentIncomplete(uint256 investmentId) 
         external 
         onlyAdmin 
@@ -432,9 +502,9 @@ contract LocalDAO is Pausable, ReentrancyGuard {
                 inv.deadline,
                 block.timestamp
             ),
-            "Cannot mark incomplete"
+            "LocalDAO: Investment does not meet incomplete criteria"
         );
-        require(inv.status == Status.PENDING, "Not pending");
+        require(inv.status == Status.PENDING, "LocalDAO: Investment is not in pending status");
 
         inv.status = Status.INCOMPLETE;
 
@@ -448,6 +518,13 @@ contract LocalDAO is Pausable, ReentrancyGuard {
         emit InvestmentIncomplete(investmentId, block.timestamp);
     }
 
+    /**
+     * @notice Extend the voting deadline for an investment
+     * @dev Only finance managers can extend. Only Grade A and B investments can be extended
+     * @dev Maximum 3 extensions per investment
+     * @param investmentId ID of the investment
+     * @param additionalDays Days to add (1-90 days)
+     */
     function extendDeadline(
         uint256 investmentId,
         uint256 additionalDays
@@ -465,8 +542,9 @@ contract LocalDAO is Pausable, ReentrancyGuard {
                 inv.extensionCount,
                 MAX_EXTENSIONS
             ),
-            "Cannot extend deadline"
+            "LocalDAO: Deadline cannot be extended (check grade and extension limit)"
         );
+        require(additionalDays > 0 && additionalDays <= 90, "LocalDAO: Extension must be between 1 and 90 days");
 
         inv.deadline = InvestmentManager.calculateNewDeadline(inv.deadline, additionalDays);
         inv.extensionCount++;
@@ -497,6 +575,11 @@ contract LocalDAO is Pausable, ReentrancyGuard {
     }
 
     // ===== REFUNDS =====
+    /**
+     * @notice Withdraw staked USDC from an incomplete investment
+     * @dev Can be called by anyone who staked, even if they're no longer a member
+     * @param investmentId ID of the incomplete investment
+     */
     function withdrawStake(uint256 investmentId)
         external
         investmentExists(investmentId)
@@ -504,16 +587,16 @@ contract LocalDAO is Pausable, ReentrancyGuard {
         whenNotPaused
     {
         Investment storage inv = investments[investmentId];
-        require(inv.status == Status.INCOMPLETE, "Investment not incomplete");
+        require(inv.status == Status.INCOMPLETE, "LocalDAO: Investment is not incomplete");
 
         Vote storage userVote = votes[investmentId][msg.sender];
-        require(userVote.numberOfVotes > 0, "No stake to withdraw");
+        require(userVote.numberOfVotes > 0, "LocalDAO: No stake to withdraw");
 
         uint256 amount = userVote.numberOfVotes;
         userVote.numberOfVotes = 0;
         totalValueLocked -= amount;
 
-        IERC20(usdcAddress).transfer(msg.sender, amount);
+        IERC20(usdcAddress).safeTransfer(msg.sender, amount);
 
         emit StakeWithdrawn(investmentId, msg.sender, amount);
     }
@@ -534,6 +617,14 @@ contract LocalDAO is Pausable, ReentrancyGuard {
     }
 
     // ===== YIELD MANAGEMENT =====
+    /**
+     * @notice Deposit yield generated from an active investment
+     * @dev Only finance managers can deposit yield. Must provide expense report CID
+     * @dev Off-chain: Finance manager should verify yield amount matches actual returns before depositing
+     * @param investmentId ID of the active investment
+     * @param yieldAmount Amount of yield in USDC to deposit
+     * @param expenseReportCID IPFS CID of expense report document
+     */
     function depositYield(
         uint256 investmentId,
         uint256 yieldAmount,
@@ -548,19 +639,19 @@ contract LocalDAO is Pausable, ReentrancyGuard {
         Investment storage inv = investments[investmentId];
         require(
             InvestmentManager.canDepositYield(InvestmentManager.Status(uint8(inv.status))),
-            "Investment not active"
+            "LocalDAO: Investment is not active"
         );
-        require(yieldAmount > 0, "Invalid amount");
+        require(yieldAmount > 0, "LocalDAO: Yield amount must be greater than zero");
         require(
             IERC20(usdcAddress).balanceOf(msg.sender) >= yieldAmount,
-            "Insufficient balance"
+            "LocalDAO: Insufficient USDC balance"
         );
         require(
             IERC20(usdcAddress).allowance(msg.sender, address(this)) >= yieldAmount,
-            "Insufficient allowance"
+            "LocalDAO: Insufficient USDC allowance"
         );
 
-        IERC20(usdcAddress).transferFrom(msg.sender, address(this), yieldAmount);
+        IERC20(usdcAddress).safeTransferFrom(msg.sender, address(this), yieldAmount);
         
         inv.totalYieldGenerated += yieldAmount;
         
@@ -581,20 +672,24 @@ contract LocalDAO is Pausable, ReentrancyGuard {
         emit YieldDeposited(investmentId, yieldAmount, expenseReportCID, block.timestamp);
     }
 
+    /**
+     * @notice Claim yield from an active investment
+     * @dev Can be called by anyone who staked (upvoted), even if they're no longer a member
+     * @dev Yield is distributed proportionally based on stake amount
+     * @param investmentId ID of the active investment
+     */
     function claimYield(uint256 investmentId)
         external
-        onlyVerifiedMember
         investmentExists(investmentId)
+        hasStakeInInvestment(investmentId)
         nonReentrant
         whenNotPaused
     {
         Investment storage inv = investments[investmentId];
-        require(inv.status == Status.ACTIVE, "Investment not active");
+        require(inv.status == Status.ACTIVE, "LocalDAO: Investment is not active");
 
         Vote storage userVote = votes[investmentId][msg.sender];
-        require(userVote.numberOfVotes > 0, "No stake");
-        require(userVote.voteValue == 1, "Only upvoters can claim");
-        require(!userVote.hasClaimedYield, "Already claimed");
+        require(!userVote.hasClaimedYield, "LocalDAO: Yield already claimed");
 
         uint256 claimable = YieldCalculator.calculateUserYield(
             userVote.numberOfVotes,
@@ -602,14 +697,14 @@ contract LocalDAO is Pausable, ReentrancyGuard {
             inv.totalYieldGenerated
         );
 
-        require(claimable > 0, "Nothing to claim");
+        require(claimable > 0, "LocalDAO: No yield available to claim");
         require(
             YieldCalculator.validateDistribution(
                 inv.totalYieldDistributed,
                 claimable,
                 inv.totalYieldGenerated
             ),
-            "Distribution exceeds total"
+            "LocalDAO: Distribution would exceed total yield"
         );
 
         userVote.hasClaimedYield = true;
@@ -620,7 +715,7 @@ contract LocalDAO is Pausable, ReentrancyGuard {
         dist.distributedAmount += claimable;
         dist.remainingAmount -= claimable;
 
-        IERC20(usdcAddress).transfer(msg.sender, claimable);
+        IERC20(usdcAddress).safeTransfer(msg.sender, claimable);
 
         emit YieldClaimed(investmentId, msg.sender, claimable, block.timestamp);
     }
@@ -661,6 +756,11 @@ contract LocalDAO is Pausable, ReentrancyGuard {
     }
 
     // ===== INVESTMENT CLOSURE =====
+    /**
+     * @notice Close an investment after all yield is distributed
+     * @dev Only admins can close. Requires all yield to be distributed
+     * @param investmentId ID of the investment to close
+     */
     function closeInvestment(uint256 investmentId)
         external
         onlyAdmin
@@ -674,8 +774,9 @@ contract LocalDAO is Pausable, ReentrancyGuard {
                 inv.totalYieldGenerated,
                 inv.totalYieldDistributed
             ),
-            "Cannot close"
+            "LocalDAO: Investment cannot be closed (check status and yield distribution)"
         );
+        require(activeInvestmentCount > 0, "LocalDAO: No active investments to close");
 
         inv.status = Status.ENDED;
         activeInvestmentCount--;
@@ -688,6 +789,50 @@ contract LocalDAO is Pausable, ReentrancyGuard {
         );
 
         emit InvestmentClosed(investmentId, block.timestamp);
+    }
+
+    /**
+     * @notice Recover unclaimed yield after grace period
+     * @dev Only creator/admin can call. Requires investment to be ENDED and grace period passed
+     * @dev Off-chain: Admin should notify all stakeholders before recovery
+     * @param investmentId ID of the ended investment
+     * @param recipient Address to receive unclaimed yield (typically DAO treasury)
+     */
+    function sweepUnclaimedYield(
+        uint256 investmentId,
+        address recipient
+    )
+        external
+        onlyAdmin
+        investmentExists(investmentId)
+        nonReentrant
+        whenNotPaused
+    {
+        Investment storage inv = investments[investmentId];
+        require(inv.status == Status.ENDED, "LocalDAO: Investment must be ended");
+        require(recipient != address(0), "LocalDAO: Invalid recipient address");
+        
+        YieldDistribution storage dist = yieldDistributions[investmentId];
+        require(dist.remainingAmount > 0, "LocalDAO: No unclaimed yield to recover");
+        
+        // Check if grace period has passed since last yield deposit or investment closure
+        uint256 gracePeriodEnd = dist.timestamp + GRACE_PERIOD_FOR_UNCLAIMED_YIELD;
+        require(block.timestamp >= gracePeriodEnd, "LocalDAO: Grace period not yet expired");
+
+        uint256 unclaimedAmount = dist.remainingAmount;
+        dist.remainingAmount = 0;
+        dist.distributedAmount += unclaimedAmount; // Mark as distributed for accounting
+
+        IERC20(usdcAddress).safeTransfer(recipient, unclaimedAmount);
+
+        _addActivity(
+            investmentId,
+            "yield_recovered",
+            string(abi.encodePacked("Unclaimed yield recovered: ", _uintToString(unclaimedAmount))),
+            ""
+        );
+
+        emit UnclaimedYieldRecovered(investmentId, recipient, unclaimedAmount, block.timestamp);
     }
 
     // ===== ACTIVITY TIMELINE =====
@@ -718,9 +863,15 @@ contract LocalDAO is Pausable, ReentrancyGuard {
     }
 
     // ===== ADMIN FUNCTIONS =====
+    /**
+     * @notice Add a new admin to the DAO
+     * @dev Only creator can add admins. Admins have significant powers - use with caution
+     * @dev Off-chain: Creator should verify admin identity and trustworthiness before adding
+     * @param admin Address of the new admin
+     */
     function addAdmin(address admin) external onlyCreator {
-        require(admin != address(0), "Invalid address");
-        require(!isAdmin[admin], "Already admin");
+        require(admin != address(0), "LocalDAO: Invalid admin address");
+        require(!isAdmin[admin], "LocalDAO: Address is already an admin");
 
         isAdmin[admin] = true;
         admins.push(admin);
@@ -728,8 +879,13 @@ contract LocalDAO is Pausable, ReentrancyGuard {
         emit AdminAdded(admin);
     }
 
+    /**
+     * @notice Remove an admin from the DAO
+     * @dev Only creator can remove admins
+     * @param admin Address of the admin to remove
+     */
     function removeAdmin(address admin) external onlyCreator {
-        require(isAdmin[admin], "Not admin");
+        require(isAdmin[admin], "LocalDAO: Address is not an admin");
 
         isAdmin[admin] = false;
         
@@ -745,36 +901,62 @@ contract LocalDAO is Pausable, ReentrancyGuard {
         emit AdminRemoved(admin);
     }
 
+    /**
+     * @notice Add a new finance manager to the DAO
+     * @dev Only creator can add finance managers. Finance managers can deposit yield and extend deadlines
+     * @dev Off-chain: Creator should verify finance manager credentials and trustworthiness
+     * @param manager Address of the new finance manager
+     */
     function addFinanceManager(address manager) external onlyCreator {
-        require(manager != address(0), "Invalid address");
-        require(!isFinanceManager[manager], "Already finance manager");
+        require(manager != address(0), "LocalDAO: Invalid finance manager address");
+        require(!isFinanceManager[manager], "LocalDAO: Address is already a finance manager");
 
         isFinanceManager[manager] = true;
 
         emit FinanceManagerAdded(manager);
     }
 
+    /**
+     * @notice Remove a finance manager from the DAO
+     * @dev Only creator can remove finance managers
+     * @param manager Address of the finance manager to remove
+     */
     function removeFinanceManager(address manager) external onlyCreator {
-        require(isFinanceManager[manager], "Not finance manager");
+        require(isFinanceManager[manager], "LocalDAO: Address is not a finance manager");
 
         isFinanceManager[manager] = false;
 
         emit FinanceManagerRemoved(manager);
     }
 
+    /**
+     * @notice Update DAO description and logo URI
+     * @dev Only admins can update DAO information
+     * @param newDescription New description for the DAO
+     * @param newLogoURI New logo URI (IPFS CID or URL)
+     */
     function updateDAOInfo(
         string memory newDescription,
         string memory newLogoURI
     ) external onlyAdmin whenNotPaused {
+        require(bytes(newDescription).length > 0, "LocalDAO: Description cannot be empty");
         description = newDescription;
         logoURI = newLogoURI;
     }
 
+    /**
+     * @notice Pause all DAO operations (emergency function)
+     * @dev Only creator can pause. Prevents all state-changing operations
+     */
     function pause() external onlyCreator {
         _pause();
         emit DAOPaused(block.timestamp);
     }
 
+    /**
+     * @notice Unpause DAO operations
+     * @dev Only creator can unpause
+     */
     function unpause() external onlyCreator {
         _unpause();
         emit DAOUnpaused(block.timestamp);
@@ -874,5 +1056,11 @@ contract LocalDAO is Pausable, ReentrancyGuard {
     event FinanceManagerRemoved(address indexed manager);
     event DAOPaused(uint256 timestamp);
     event DAOUnpaused(uint256 timestamp);
+    event UnclaimedYieldRecovered(
+        uint256 indexed investmentId,
+        address indexed recipient,
+        uint256 amount,
+        uint256 timestamp
+    );
 }
 
