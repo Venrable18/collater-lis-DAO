@@ -19,9 +19,7 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // ===== ENUMS =====
-    enum Status { PENDING, ACTIVE, ENDED, INCOMPLETE }
-    enum Category { HEALTH, EDUCATION, ENTERTAINMENT, AGRICULTURE, TECHNOLOGY, RETAIL, OTHER }
-    enum Grade { A, B, C, D }
+    // Using enums from ILocalDAO interface
 
     // ===== DAO IDENTITY =====
     string public name;
@@ -54,14 +52,14 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
     struct Investment {
         uint256 id;
         string name;
-        Status status;
-        Category category;
+        ILocalDAO.Status status;
+        ILocalDAO.Category category;
         uint256 deadline;
         uint256 upvotes;
         uint256 downvotes;
         uint256 fundNeeded;
         uint256 expectedYield;
-        Grade grade;
+        ILocalDAO.Grade grade;
         string[] documentCIDs;
         uint256 totalYieldGenerated;
         uint256 totalYieldDistributed;
@@ -276,10 +274,10 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
      */
     function createInvestment(
         string memory _name,
-        Category category,
+        ILocalDAO.Category category,
         uint256 fundNeeded,
         uint256 expectedYield,
-        Grade grade,
+        ILocalDAO.Grade grade,
         uint256 deadline,
         string[] memory documentCIDs
     ) external onlyAdmin whenNotPaused returns (uint256 investmentId) {
@@ -295,7 +293,7 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
         investments[investmentId] = Investment({
             id: investmentId,
             name: _name,
-            status: Status.PENDING,
+            status: ILocalDAO.Status.PENDING,
             category: category,
             deadline: block.timestamp + (deadline * 1 days),
             upvotes: 0,
@@ -340,7 +338,7 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
         return all;
     }
 
-    function getInvestmentsByStatus(Status status) 
+    function getInvestmentsByStatus(ILocalDAO.Status status) 
         external 
         view 
         returns (Investment[] memory) 
@@ -384,7 +382,7 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
         whenNotPaused
     {
         Investment storage inv = investments[investmentId];
-        require(inv.status == Status.PENDING, "LocalDAO: Investment is not in pending status");
+        require(inv.status == ILocalDAO.Status.PENDING, "LocalDAO: Investment is not in pending status");
         require(block.timestamp <= inv.deadline, "LocalDAO: Voting deadline has passed");
         require(voteValue <= 1, "LocalDAO: Vote value must be 0 (downvote) or 1 (upvote)");
         require(votes[investmentId][msg.sender].numberOfVotes == 0, "LocalDAO: Already voted on this investment");
@@ -467,9 +465,9 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
             ),
             "LocalDAO: Investment does not meet activation requirements"
         );
-        require(inv.status == Status.PENDING, "LocalDAO: Investment is not in pending status");
+        require(inv.status == ILocalDAO.Status.PENDING, "LocalDAO: Investment is not in pending status");
 
-        inv.status = Status.ACTIVE;
+        inv.status = ILocalDAO.Status.ACTIVE;
         activeInvestmentCount++;
 
         _addActivity(
@@ -504,9 +502,9 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
             ),
             "LocalDAO: Investment does not meet incomplete criteria"
         );
-        require(inv.status == Status.PENDING, "LocalDAO: Investment is not in pending status");
+        require(inv.status == ILocalDAO.Status.PENDING, "LocalDAO: Investment is not in pending status");
 
-        inv.status = Status.INCOMPLETE;
+        inv.status = ILocalDAO.Status.INCOMPLETE;
 
         _addActivity(
             investmentId,
@@ -587,7 +585,7 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
         whenNotPaused
     {
         Investment storage inv = investments[investmentId];
-        require(inv.status == Status.INCOMPLETE, "LocalDAO: Investment is not incomplete");
+        require(inv.status == ILocalDAO.Status.INCOMPLETE, "LocalDAO: Investment is not incomplete");
 
         Vote storage userVote = votes[investmentId][msg.sender];
         require(userVote.numberOfVotes > 0, "LocalDAO: No stake to withdraw");
@@ -608,7 +606,7 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
         returns (uint256)
     {
         Investment memory inv = investments[investmentId];
-        if (inv.status != Status.INCOMPLETE) {
+        if (inv.status != ILocalDAO.Status.INCOMPLETE) {
             return 0;
         }
 
@@ -686,7 +684,7 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
         whenNotPaused
     {
         Investment storage inv = investments[investmentId];
-        require(inv.status == Status.ACTIVE, "LocalDAO: Investment is not active");
+        require(inv.status == ILocalDAO.Status.ACTIVE, "LocalDAO: Investment is not active");
 
         Vote storage userVote = votes[investmentId][msg.sender];
         require(!userVote.hasClaimedYield, "LocalDAO: Yield already claimed");
@@ -730,7 +728,7 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
         returns (uint256 claimableAmount) 
     {
         Investment memory inv = investments[investmentId];
-        if (inv.status != Status.ACTIVE) {
+        if (inv.status != ILocalDAO.Status.ACTIVE) {
             return 0;
         }
 
@@ -778,7 +776,7 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
         );
         require(activeInvestmentCount > 0, "LocalDAO: No active investments to close");
 
-        inv.status = Status.ENDED;
+        inv.status = ILocalDAO.Status.ENDED;
         activeInvestmentCount--;
 
         _addActivity(
@@ -809,7 +807,7 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
         whenNotPaused
     {
         Investment storage inv = investments[investmentId];
-        require(inv.status == Status.ENDED, "LocalDAO: Investment must be ended");
+        require(inv.status == ILocalDAO.Status.ENDED, "LocalDAO: Investment must be ended");
         require(recipient != address(0), "LocalDAO: Invalid recipient address");
         
         YieldDistribution storage dist = yieldDistributions[investmentId];
