@@ -32,7 +32,8 @@ contract LocalDAOFactoryTest is Test {
         user2 = address(0x3);
 
         vm.startPrank(owner);
-        factory = new LocalDAOFactory(owner);
+        LocalDAO implementation = new LocalDAO();
+        factory = new LocalDAOFactory(owner, address(implementation));
         usdc = new MockUSDC();
         vm.stopPrank();
     }

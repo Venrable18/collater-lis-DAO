@@ -5,8 +5,10 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import {YieldCalculator} from "./libraries/YieldCalculator.sol";
 import {InvestmentManager} from "./libraries/InvestmentManager.sol";
+import {StringUtils} from "./libraries/StringUtils.sol";
 import {ILocalDAO} from "./interfaces/ILocalDAO.sol";
 
 /**
@@ -14,9 +16,22 @@ import {ILocalDAO} from "./interfaces/ILocalDAO.sol";
  * @notice Core DAO contract for governance, investments, and treasury management
  * @dev Implements ILocalDAO interface for standardized interactions
  * @dev Uses SafeERC20 for secure token transfers
+ * @dev Deployed as EIP-1167 minimal proxy clones from LocalDAOFactory
  */
-contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
+contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard, Initializable {
     using SafeERC20 for IERC20;
+
+    // Custom errors (save ~40 bytes each vs string requires)
+    error InvalidInvestment();
+    error NotPending();
+    error DeadlinePassed();
+    error InvalidVoteValue();
+    error UpvoteRequiresStake();
+    error InsufficientBalance();
+    error InsufficientAllowance();
+    error CannotChangeDownToUp();
+    error AlreadyVoted();
+    error DownvoteNoStake();
 
     // ===== ENUMS =====
     // Using enums from ILocalDAO interface
@@ -151,12 +166,28 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
     }
 
     modifier investmentExists(uint256 investmentId) {
-        require(investmentId > 0 && investmentId <= investmentCount, "Invalid investment");
+        if (investmentId == 0 || investmentId > investmentCount) revert InvalidInvestment();
         _;
     }
 
-    // ===== CONSTRUCTOR =====
-    constructor(
+    // ===== CONSTRUCTOR / INITIALIZER =====
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /**
+     * @notice Initialize the LocalDAO (called by factory when deploying clone)
+     * @param _creator DAO creator address
+     * @param _name DAO name
+     * @param _description DAO mission statement
+     * @param _location Geographic location
+     * @param _coordinates GPS coordinates
+     * @param _postalCode Postal/ZIP code
+     * @param _maxMembership Maximum members allowed
+     * @param _usdcAddress USDC token address
+     */
+    function initialize(
         address _creator,
         string memory _name,
         string memory _description,
@@ -165,10 +196,10 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
         string memory _postalCode,
         uint256 _maxMembership,
         address _usdcAddress
-    ) {
+    ) external initializer {
         require(_creator != address(0), "Invalid creator");
         require(_usdcAddress != address(0), "Invalid USDC address");
-        
+
         creator = _creator;
         name = _name;
         description = _description;
@@ -364,8 +395,9 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
     // ===== VOTING =====
     /**
      * @notice Cast a vote on an investment proposal
-     * @dev Upvotes require USDC staking, downvotes are free
-     * @dev Only verified members can vote
+     * @dev Upvotes require USDC staking (1 USDC = 1 vote). Voters can add more votes by calling again.
+     * @dev Downvotes are free and allowed only once per user per investment.
+     * @dev Only verified members can vote. Supports multiple upvotes per user (e.g. stake 10 USDC for 10 votes).
      * @param investmentId ID of the investment to vote on
      * @param numberOfVotes Amount of USDC to stake (must be > 0 for upvote, 0 for downvote)
      * @param voteValue 1 for upvote, 0 for downvote
@@ -382,43 +414,49 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
         whenNotPaused
     {
         Investment storage inv = investments[investmentId];
-        require(inv.status == ILocalDAO.Status.PENDING, "LocalDAO: Investment is not in pending status");
-        require(block.timestamp <= inv.deadline, "LocalDAO: Voting deadline has passed");
-        require(voteValue <= 1, "LocalDAO: Vote value must be 0 (downvote) or 1 (upvote)");
-        require(votes[investmentId][msg.sender].numberOfVotes == 0, "LocalDAO: Already voted on this investment");
+        if (inv.status != ILocalDAO.Status.PENDING) revert NotPending();
+        if (block.timestamp > inv.deadline) revert DeadlinePassed();
+        if (voteValue > 1) revert InvalidVoteValue();
+
+        Vote storage userVote = votes[investmentId][msg.sender];
 
         if (voteValue == 1) {
-            // Upvote - requires USDC staking
-            require(numberOfVotes > 0, "LocalDAO: Upvote requires staking USDC");
-            require(IERC20(usdcAddress).balanceOf(msg.sender) >= numberOfVotes, "LocalDAO: Insufficient USDC balance");
-            require(
-                IERC20(usdcAddress).allowance(msg.sender, address(this)) >= numberOfVotes,
-                "LocalDAO: Insufficient USDC allowance"
-            );
+            if (numberOfVotes == 0) revert UpvoteRequiresStake();
+            if (IERC20(usdcAddress).balanceOf(msg.sender) < numberOfVotes) revert InsufficientBalance();
+            if (IERC20(usdcAddress).allowance(msg.sender, address(this)) < numberOfVotes) revert InsufficientAllowance();
+            if (userVote.numberOfVotes != 0 && userVote.voteValue != 1) revert CannotChangeDownToUp();
 
             IERC20(usdcAddress).safeTransferFrom(msg.sender, address(this), numberOfVotes);
+
+            // Accumulate stake instead of replacing
+            userVote.voter = msg.sender;
+            userVote.investmentId = investmentId;
+            userVote.numberOfVotes += numberOfVotes;
+            userVote.voteValue = 1;
+            userVote.timestamp = block.timestamp;
+            // preserve hasClaimedYield and yieldClaimed as-is
+
             inv.upvotes += numberOfVotes;
             totalValueLocked += numberOfVotes;
         } else {
-            // Downvote - no staking required
-            require(numberOfVotes == 0, "LocalDAO: Downvote requires no stake");
+            if (userVote.numberOfVotes != 0) revert AlreadyVoted();
+            if (numberOfVotes != 0) revert DownvoteNoStake();
+
+            userVote.voter = msg.sender;
+            userVote.investmentId = investmentId;
+            userVote.numberOfVotes = 0;
+            userVote.voteValue = 0;
+            userVote.timestamp = block.timestamp;
+            userVote.hasClaimedYield = false;
+            userVote.yieldClaimed = 0;
+
             inv.downvotes++;
         }
-
-        votes[investmentId][msg.sender] = Vote({
-            voter: msg.sender,
-            investmentId: investmentId,
-            numberOfVotes: numberOfVotes,
-            voteValue: voteValue,
-            timestamp: block.timestamp,
-            hasClaimedYield: false,
-            yieldClaimed: 0
-        });
 
         _addActivity(
             investmentId,
             "vote_cast",
-            string(abi.encodePacked("Vote cast by ", _addressToString(msg.sender))),
+            string(abi.encodePacked("Vote cast by ", StringUtils.addressToString(msg.sender))),
             ""
         );
 
@@ -550,7 +588,7 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
         _addActivity(
             investmentId,
             "deadline_extended",
-            string(abi.encodePacked("Deadline extended by ", _uintToString(additionalDays), " days")),
+            string(abi.encodePacked("Deadline extended by ", StringUtils.uintToString(additionalDays), " days")),
             ""
         );
 
@@ -663,7 +701,7 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
         _addActivity(
             investmentId,
             "yield_deposited",
-            string(abi.encodePacked("Yield deposited: ", _uintToString(yieldAmount))),
+            string(abi.encodePacked("Yield deposited: ", StringUtils.uintToString(yieldAmount))),
             expenseReportCID
         );
 
@@ -826,7 +864,7 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
         _addActivity(
             investmentId,
             "yield_recovered",
-            string(abi.encodePacked("Unclaimed yield recovered: ", _uintToString(unclaimedAmount))),
+            string(abi.encodePacked("Unclaimed yield recovered: ", StringUtils.uintToString(unclaimedAmount))),
             ""
         );
 
@@ -958,39 +996,6 @@ contract LocalDAO is ILocalDAO, Pausable, ReentrancyGuard {
     function unpause() external onlyCreator {
         _unpause();
         emit DAOUnpaused(block.timestamp);
-    }
-
-    // ===== HELPER FUNCTIONS =====
-    function _addressToString(address addr) internal pure returns (string memory) {
-        bytes32 value = bytes32(uint256(uint160(addr)));
-        bytes memory alphabet = "0123456789abcdef";
-        bytes memory str = new bytes(42);
-        str[0] = '0';
-        str[1] = 'x';
-        for (uint256 i = 0; i < 20; i++) {
-            str[2+i*2] = alphabet[uint8(value[i + 12] >> 4)];
-            str[3+i*2] = alphabet[uint8(value[i + 12] & 0x0f)];
-        }
-        return string(str);
-    }
-
-    function _uintToString(uint256 value) internal pure returns (string memory) {
-        if (value == 0) {
-            return "0";
-        }
-        uint256 temp = value;
-        uint256 digits;
-        while (temp != 0) {
-            digits++;
-            temp /= 10;
-        }
-        bytes memory buffer = new bytes(digits);
-        while (value != 0) {
-            digits -= 1;
-            buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
-            value /= 10;
-        }
-        return string(buffer);
     }
 
     // ===== EVENTS =====

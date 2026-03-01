@@ -35,9 +35,10 @@ contract LocalDAOTest is Test {
         // Deploy USDC
         usdc = new MockUSDC();
 
-        // Deploy Factory
+        // Deploy LocalDAO implementation and Factory (proxy pattern)
+        LocalDAO implementation = new LocalDAO();
         vm.prank(creator);
-        factory = new LocalDAOFactory(creator);
+        factory = new LocalDAOFactory(creator, address(implementation));
 
         // Create DAO
         vm.prank(creator);
@@ -212,6 +213,31 @@ contract LocalDAOTest is Test {
         assertEq(usdc.balanceOf(address(dao)), 5000 * 1e6);
     }
 
+    function test_Vote_Upvote_Accumulation() public {
+        // User can add multiple votes (e.g. 10 USDC = 10 votes for grade A projects)
+        vm.prank(admin);
+        uint256 investmentId = dao.createInvestment(
+            "Hospital Project",
+            ILocalDAO.Category.HEALTH,
+            100000 * 1e6,
+            5,
+            ILocalDAO.Grade.A,
+            30,
+            new string[](0)
+        );
+
+        vm.startPrank(member1);
+        usdc.approve(address(dao), 10000 * 1e6);
+        dao.vote(investmentId, 3000 * 1e6, 1); // First vote: 3k USDC
+        dao.vote(investmentId, 7000 * 1e6, 1); // Add 7k more = 10k total
+        vm.stopPrank();
+
+        LocalDAO.Vote memory vote = dao.getVote(investmentId, member1);
+        assertEq(vote.numberOfVotes, 10000 * 1e6);
+        (uint256 upvotes,) = dao.getVoteCounts(investmentId);
+        assertEq(upvotes, 10000 * 1e6);
+    }
+
     function test_Vote_Downvote() public {
         vm.prank(admin);
         uint256 investmentId = dao.createInvestment(
@@ -270,7 +296,7 @@ contract LocalDAOTest is Test {
 
         vm.startPrank(member1);
         usdc.approve(address(dao), 1000 * 1e6);
-        vm.expectRevert("LocalDAO: Voting deadline has passed");
+        vm.expectRevert(LocalDAO.DeadlinePassed.selector);
         dao.vote(investmentId, 1000 * 1e6, 1);
         vm.stopPrank();
     }

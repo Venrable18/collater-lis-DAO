@@ -2,14 +2,17 @@
 pragma solidity ^0.8.20;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {LocalDAO} from "./LocalDAO.sol";
 
 /**
  * @title LocalDAOFactory
- * @notice Factory contract for deploying and tracking LocalDAO instances
+ * @notice Factory contract for deploying LocalDAO instances as EIP-1167 minimal proxies
+ * @dev Uses Clones library for gas-efficient deployment. Implementation is deployed separately.
  */
 contract LocalDAOFactory is Ownable {
     // ===== STATE VARIABLES =====
+    address public immutable implementation;
     address[] public allDAOs;
     mapping(address => bool) public isDAO;
     
@@ -24,7 +27,12 @@ contract LocalDAOFactory is Ownable {
     mapping(address => DAOMetadata) public daoInfo;
 
     // ===== CONSTRUCTOR =====
-    constructor(address _owner) Ownable(_owner) {}
+    /// @param _owner Factory owner
+    /// @param _implementation Address of LocalDAO implementation (deploy separately first)
+    constructor(address _owner, address _implementation) Ownable(_owner) {
+        require(_implementation != address(0), "Invalid implementation");
+        implementation = _implementation;
+    }
 
     // ===== CORE FUNCTIONS =====
     /**
@@ -52,7 +60,11 @@ contract LocalDAOFactory is Ownable {
         require(maxMembership > 0, "Invalid max membership");
         require(usdcAddress != address(0), "Invalid USDC address");
 
-        LocalDAO newDAO = new LocalDAO(
+        // Deploy EIP-1167 minimal proxy (clone)
+        daoAddress = Clones.clone(implementation);
+
+        // Initialize the clone
+        LocalDAO(daoAddress).initialize(
             msg.sender,
             name,
             description,
@@ -62,8 +74,6 @@ contract LocalDAOFactory is Ownable {
             maxMembership,
             usdcAddress
         );
-
-        daoAddress = address(newDAO);
         
         allDAOs.push(daoAddress);
         isDAO[daoAddress] = true;
